@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../redis-common.sh"
+RUN_DIR="$(mktemp -d)"
+RUN_ID="$(basename "${RUN_DIR}")-$$-${RANDOM}"
+LOG_DIR="${RUN_DIR}/logs"
+SAMPLE_LOG_DIR="${RUN_DIR}/sample-logs"
+SUPPORTCHAT_LOG_DIR="${SAMPLE_LOG_DIR}"
+mkdir -p "${LOG_DIR}" "${SUPPORTCHAT_LOG_DIR}"
+SUPPORTCHAT_WAIT_ATTEMPTS=300
+SUPPORTCHAT_WAIT_INTERVAL_SECONDS=0.1
+
+PIDS=()
+REDIS_CONTAINER=""
+RUN_SUCCEEDED=0
+SUPPORTCHAT_REDIS_KEY_PREFIX="supportchat:dotnet:${RUN_ID}:"
+
+cleanup() {
+  find "${RUN_DIR}" -type f -name "*.json" -delete 2>/dev/null || true
+  zlink_sample_stop_processes "${PIDS[@]}"
+  if [[ -n "${REDIS_CONTAINER}" ]]; then
+    zlink_redis_remove_by_id "${REDIS_CONTAINER}" || true
+  fi
+  zlink_sample_copy_evidence "${RUN_DIR}" "SupportChat"
+  if [[ "${RUN_SUCCEEDED}" == "1" ]]; then
+    rm -rf "${RUN_DIR}"
+  else
+    echo "runDir=${RUN_DIR}"
+  fi
+}
+trap zlink_sample_exit_trap EXIT
+
+read -r -a PORTS <<<"$(zlink_sample_pick_ports 4)"
+
+SUPPORTCHAT_SUPPORT_MESH_ENDPOINT="tcp://127.0.0.1:${PORTS[0]}"
+SUPPORTCHAT_API_MESH_ENDPOINT="tcp://127.0.0.1:${PORTS[1]}"
+SUPPORTCHAT_SESSION_MESH_ENDPOINT="tcp://127.0.0.1:${PORTS[2]}"
+SUPPORTCHAT_STREAM_ENDPOINT="tcp://127.0.0.1:${PORTS[3]}"
+
+endpoint_host() {
+  local endpoint="$1"
+  endpoint="${endpoint#tcp://}"
+  echo "${endpoint%:*}"
+}
+
+endpoint_port() {
+  local endpoint="$1"
+  endpoint="${endpoint#tcp://}"
+  echo "${endpoint##*:}"
+}
+
+wait_port() {
+  local name="$1"
+  local endpoint="$2"
+  local host
+  local port
+  host="$(endpoint_host "${endpoint}")"
+  port="$(endpoint_port "${endpoint}")"
+  for _ in $(seq 1 "${SUPPORTCHAT_WAIT_ATTEMPTS}"); do
+    if (echo >"/dev/tcp/${host}/${port}") >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "${SUPPORTCHAT_WAIT_INTERVAL_SECONDS}"
+  done
+  echo "Timed out waiting for ${name} at ${endpoint}" >&2
+  return 1
+}
+
+start_server() {
+  local name="$1"
+  local project="$2"
+  shift 2
+  local project_dir
+  local project_name
+  local assembly
+  project_dir="$(cd "$(dirname "${project}")" && pwd)"
+  project_name="$(basename "${project}" .csproj)"
+  assembly="${project_dir}/bin/Debug/net8.0/${project_name}.dll"
+  dotnet "${assembly}" "$@" >"${LOG_DIR}/${name}.log" 2>&1 &
+  PIDS+=("$!")
+}
+
+log_count() {
+  local pattern="$1"
+  shift
+  local count=0
+  local file
+  local matches
+  for file in "$@"; do
+    if [[ -f "${file}" ]]; then
+      matches="$(grep -F -c -- "${pattern}" "${file}" || true)"
+      count=$((count + matches))
+    fi
+  done
+  echo "${count}"
+}
+
+wait_log_at_least() {
+  local expected="$1"
+  local pattern="$2"
+  shift 2
+  for _ in $(seq 1 "${SUPPORTCHAT_WAIT_ATTEMPTS}"); do
+    if (( $(log_count "${pattern}" "$@") >= expected )); then
+      return 0
+    fi
+    sleep "${SUPPORTCHAT_WAIT_INTERVAL_SECONDS}"
+  done
+  echo "Timed out waiting for at least ${expected} occurrence(s) of '${pattern}'" >&2
+  return 1
+}
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is required to run the SupportChat sample." >&2
+  exit 1
+fi
+REDIS_CONTAINER="zlink-supportchat-dotnet-redis-${RUN_ID}"
+zlink_redis_start_scoped_assign REDIS_CONTAINER SUPPORTCHAT_REDIS_ENDPOINT "zlink-supportchat-dotnet-redis" redis:7.2-alpine
+wait_port redis "tcp://${SUPPORTCHAT_REDIS_ENDPOINT}"
+SUPPORT_CONFIG_FILE="${RUN_DIR}/appsettings.support.json"
+API_CONFIG_FILE="${RUN_DIR}/appsettings.api.json"
+SESSION_CONFIG_FILE="${RUN_DIR}/appsettings.session.json"
+CLIENT_CONFIG_FILE="${RUN_DIR}/appsettings.client.json"
+cat >"$SUPPORT_CONFIG_FILE" <<EOF
+{"Sample":{"LogDirectory":"${SUPPORTCHAT_LOG_DIR}","RedisEndpoint":"${SUPPORTCHAT_REDIS_ENDPOINT}","RedisKeyPrefix":"${SUPPORTCHAT_REDIS_KEY_PREFIX}","MeshEndpoint":"${SUPPORTCHAT_SUPPORT_MESH_ENDPOINT}"}}
+EOF
+cat >"$API_CONFIG_FILE" <<EOF
+{"Sample":{"LogDirectory":"${SUPPORTCHAT_LOG_DIR}","RedisEndpoint":"${SUPPORTCHAT_REDIS_ENDPOINT}","RedisKeyPrefix":"${SUPPORTCHAT_REDIS_KEY_PREFIX}","MeshEndpoint":"${SUPPORTCHAT_API_MESH_ENDPOINT}"}}
+EOF
+cat >"$SESSION_CONFIG_FILE" <<EOF
+{"Sample":{"LogDirectory":"${SUPPORTCHAT_LOG_DIR}","RedisEndpoint":"${SUPPORTCHAT_REDIS_ENDPOINT}","RedisKeyPrefix":"${SUPPORTCHAT_REDIS_KEY_PREFIX}","MeshEndpoint":"${SUPPORTCHAT_SESSION_MESH_ENDPOINT}","StreamEndpoint":"${SUPPORTCHAT_STREAM_ENDPOINT}"}}
+EOF
+cat >"$CLIENT_CONFIG_FILE" <<EOF
+{"Client":{"LogDirectory":"${SUPPORTCHAT_LOG_DIR}","StreamEndpoint":"${SUPPORTCHAT_STREAM_ENDPOINT}"}}
+EOF
+
+dotnet build "${SCRIPT_DIR}/SupportChat.csproj" --maxcpucount:1
+
+start_server support "${SCRIPT_DIR}/Server/Support/SupportChat.Server.Support.csproj" --config "${SUPPORT_CONFIG_FILE}"
+wait_port support-mesh "${SUPPORTCHAT_SUPPORT_MESH_ENDPOINT}"
+wait_log_at_least 1 "supportchat-ready kind=public node=support" "${LOG_DIR}/support.log"
+
+start_server api "${SCRIPT_DIR}/Server/Api/SupportChat.Server.Api.csproj" --config "${API_CONFIG_FILE}"
+wait_port api-mesh "${SUPPORTCHAT_API_MESH_ENDPOINT}"
+wait_log_at_least 1 "supportchat-ready kind=public node=api" "${LOG_DIR}/api.log"
+wait_log_at_least 1 "supportchat-ready kind=spot-route node=api mesh=supportchat" "${LOG_DIR}/api.log"
+
+start_server session "${SCRIPT_DIR}/Server/Session/SupportChat.Server.Session.csproj" --config "${SESSION_CONFIG_FILE}"
+wait_port session-mesh "${SUPPORTCHAT_SESSION_MESH_ENDPOINT}"
+wait_port session-stream "${SUPPORTCHAT_STREAM_ENDPOINT}"
+wait_log_at_least 1 "supportchat-ready kind=stream node=session" "${LOG_DIR}/session.log"
+wait_log_at_least 1 "supportchat-ready kind=spot-route node=session mesh=supportchat" "${LOG_DIR}/session.log"
+
+dotnet run --no-build --project "${SCRIPT_DIR}/Client/SupportChat.Client.csproj" -- \
+  --config "${CLIENT_CONFIG_FILE}" >"${LOG_DIR}/client.log" 2>&1
+
+wait_log_at_least 1 "supportchat=completed" "${LOG_DIR}/client.log"
+wait_log_at_least 1 "supportchat-closed-typing-ignore=verified" "${LOG_DIR}/client.log"
+wait_log_at_least 1 "supportchat-conversation created conversation=" "${LOG_DIR}/api.log" "${LOG_DIR}/support.log"
+wait_log_at_least 1 "supportchat-conversation agent-joined conversation=" "${LOG_DIR}/api.log" "${LOG_DIR}/support.log"
+wait_log_at_least 1 "supportchat-conversation status=WaitingForAgent conversation=" "${LOG_DIR}/api.log" "${LOG_DIR}/support.log"
+wait_log_at_least 1 "supportchat-conversation status=Active conversation=" "${LOG_DIR}/api.log" "${LOG_DIR}/support.log"
+wait_log_at_least 1 "supportchat-conversation status=WaitingForClose conversation=" "${LOG_DIR}/api.log" "${LOG_DIR}/support.log"
+wait_log_at_least 1 "supportchat-conversation status=Closed conversation=" "${LOG_DIR}/api.log" "${LOG_DIR}/support.log"
+RUN_SUCCEEDED=1
+cleanup
+trap - EXIT
+zlink_sample_assert_graceful_teardown
+echo "supportchat-placement=completed"
