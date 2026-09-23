@@ -4,7 +4,7 @@
 하나의 흐름으로 보여 주는 .NET Framework 샘플이다.
 
 공통 시나리오 계약은
-[`DeliveryDispatch 공통 샘플`](../../../../doc/framework/common/sample/deliverydispatch/README.ko.md)에
+[`DeliveryDispatch 공통 샘플`](https://github.com/zlink-systems/zlink/blob/main/framework/doc/framework/common/sample/deliverydispatch/README.ko.md)에
 있다. 이 문서는 .NET 구현의 실행 방법과 역할 구성을 설명한다.
 
 ## 핵심 계약
