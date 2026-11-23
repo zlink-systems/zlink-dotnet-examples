@@ -21,6 +21,7 @@ internal sealed record TicTacToeMeshReadiness(
 internal sealed class TicTacToeMeshReadinessReporter(
     IEnumerable<TicTacToeMeshReadiness> readiness,
     IZLinkRouteMeshRuntime routeMesh,
+    IZLinkFrameworkRuntime host,
     ILogger<TicTacToeMeshReadinessReporter> logger
 ) : IHostedService
 {
@@ -58,16 +59,8 @@ internal sealed class TicTacToeMeshReadinessReporter(
             for (var index = pending.Count - 1; index >= 0; index--)
             {
                 var report = pending[index];
-                try
-                {
-                    if (!IsReady(report))
-                        continue;
-                }
-                catch (InvalidOperationException)
-                {
-                    // The public runtime status becomes available during Framework startup.
+                if (!IsReady(report))
                     continue;
-                }
 
                 LogReady(report);
                 pending.RemoveAt(index);
@@ -88,10 +81,12 @@ internal sealed class TicTacToeMeshReadinessReporter(
             // spec deviation as PlayServer/ApiServer's fixed-RID gap.
             // Spec 10.1: confirm the peer named in the row, not merely that some peer is ready.
             // The spot mesh uses a fixed RID so the expected peer can be named at all.
-            TicTacToeReadyKind.PeerRoute => status.Peers.Any(peer =>
-                peer.NodeRid == SampleNodes.RouteMeshRoutingId(report.PeerNodeId!)
-                && peer.State == ZLinkPeerState.Ready
-            ),
+            // User Spot placement requires this host's descriptor to be published before readiness.
+            TicTacToeReadyKind.PeerRoute => host.Status.IsReady
+                && status.Peers.Any(peer =>
+                    peer.NodeRid == SampleNodes.RouteMeshRoutingId(report.PeerNodeId!)
+                    && peer.State == ZLinkPeerState.Ready
+                ),
             // Spec 10.1: this row means the Api node can reach the Play spot mesh, not merely
             // that the mesh object exists. Mesh IsReady can be true before any object-capable Play
             // peer is admitted, which lets the client start too early and fail its first JoinSpot.
